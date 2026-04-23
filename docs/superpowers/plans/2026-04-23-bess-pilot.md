@@ -4040,6 +4040,8 @@ Every one of these surfaced in the first real boot of the stack. Bake them into 
 
 11. **Querying the Last Value Cache is not just `SELECT ... FROM cell_last`.** Returns `table 'public.iox.cell_last' not found`. Correct syntax uses a function like `last_cache('cell_last')` or similar — to be confirmed during Task 18 (queries.py) and Task 25 (CLI_EXAMPLES.md) when we write the real query code.
 
+12. **Deprecation warning from base image: `LOG_FILTER is deprecated, use INFLUXDB3_LOG_FILTER instead`.** The `influxdb:3-enterprise` image sets `LOG_FILTER=info` as a legacy default that trips this warning on every CLI invocation. Fix: set `INFLUXDB3_UNSET_VARS=LOG_FILTER` and `INFLUXDB3_LOG_FILTER=info` on all three containers using the enterprise image (`token-bootstrap`, `influxdb3`, `influxdb3-init`). This pattern generalizes — any legacy env var in the image can be neutered with `INFLUXDB3_UNSET_VARS`.
+
 ## Amendments from Checkpoint #2
 
 *(Populated during Task 17 as issues surface. Empty at plan-write time.)*
