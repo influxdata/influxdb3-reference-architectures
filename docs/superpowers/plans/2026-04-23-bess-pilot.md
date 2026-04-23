@@ -4044,4 +4044,12 @@ Every one of these surfaced in the first real boot of the stack. Bake them into 
 
 ## Amendments from Checkpoint #2
 
-*(Populated during Task 17 as issues surface. Empty at plan-write time.)*
+1. **Enterprise cron is 6-field, not 5-field.** `--trigger-spec "cron:<expr>"` requires `<sec> <min> <hour> <dom> <mon> <dow>`. Our initial 5-field `cron:5 0 * * *` was rejected with "failed to parse trigger from cron:5 0 * * *". Correct form for "00:05:00 UTC daily" is `cron:0 5 0 * * *`.
+
+2. **`LineBuilder` is NOT imported — it's injected into plugin globals.** `from influxdb3_local import LineBuilder` raises ImportError at runtime. The Processing Engine injects `LineBuilder` into the plugin's module globals before exec'ing its source. Our original `try: from influxdb3_local import LineBuilder / except: LineBuilder = None` fallback was actively harmful: the engine injected the real thing first, then the except branch ran and clobbered it with None, causing `TypeError: 'NoneType' object is not callable` on every trigger fire. Fix: plugins reference `LineBuilder` bare with no import statement. Tests attach a fake via `monkeypatch.setattr(mod, "LineBuilder", FakeLineBuilder, raising=False)`.
+
+3. **`--path` is confirmed as the CLI flag for plugin filename.** (Not `--plugin-filename`.) Per `influxdb3 create trigger --path <file.py>`.
+
+4. **Request triggers are reachable at `GET /api/v3/engine/<name>?param=value`.** Confirmed via live curl. Auth is the same Bearer token as the main API. The response body is exactly the dict the plugin's `process_request` returns — `{"status": 200, "body": {...}}` is returned as JSON verbatim.
+
+5. **Last value cache query syntax (still unresolved).** `SELECT * FROM cell_last` returns `table 'public.iox.cell_last' not found`. Correct syntax likely uses a function — to be resolved during Task 18 (queries.py).
