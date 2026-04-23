@@ -4016,7 +4016,7 @@ The next step in the portfolio roadmap (§11 Phase 2 of the portfolio spec) is t
 
 ## Amendments from Checkpoint #1
 
-*(Populated during Task 9 as issues surface. Empty at plan-write time.)*
+- **Ordering bug — `ui` service referenced in Task 7 compose but `ui/Dockerfile` is not created until Task 21.** First `make up` failed with "failed to read dockerfile" for ui. Fix: added `profiles: ["ui"]` to the ui service in docker-compose.yml so it neither starts nor builds by default. **Task 21 MUST remove this `profiles: ["ui"]` line** when `ui/Dockerfile` is created. Committed separately (not part of Task 7's commit).
 
 ## Amendments from Checkpoint #2
 
