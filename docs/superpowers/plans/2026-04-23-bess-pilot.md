@@ -4016,7 +4016,29 @@ The next step in the portfolio roadmap (§11 Phase 2 of the portfolio spec) is t
 
 ## Amendments from Checkpoint #1
 
-- **Ordering bug — `ui` service referenced in Task 7 compose but `ui/Dockerfile` is not created until Task 21.** First `make up` failed with "failed to read dockerfile" for ui. Fix: added `profiles: ["ui"]` to the ui service in docker-compose.yml so it neither starts nor builds by default. **Task 21 MUST remove this `profiles: ["ui"]` line** when `ui/Dockerfile` is created. Committed separately (not part of Task 7's commit).
+Every one of these surfaced in the first real boot of the stack. Bake them into the meta-repo's `CONVENTIONS.md` during Phase 2 template extraction.
+
+1. **`ui` service referenced before its Dockerfile exists.** Task 7 compose wired the `ui` service but `ui/Dockerfile` is created in Task 21. First build failed. Fix: added `profiles: ["ui"]` to the `ui` service so it doesn't start/build by default. **Task 21 MUST remove `profiles: ["ui"]`** when it creates `ui/Dockerfile`.
+
+2. **`SCENARIO` env var default.** Compose warned `WARN[0000] The "SCENARIO" variable is not set`. The `scenarios` service entrypoint references `${SCENARIO}` for `make scenario name=…`. Changed to `${SCENARIO:-}` to silence.
+
+3. **Processing Engine venv needs a writable location.** The image defaults to expecting `/plugins/.venv/` but our `./plugins` bind mount is `:ro`. Added `--virtual-env-location /var/lib/influxdb3/plugin-venv` to `serve` command so the venv lives in the writable data volume, keeping plugin source read-only.
+
+4. **`/health` requires auth; returns 401 for unauth'd probes.** Both the compose healthcheck and `init.sh::wait_for_api` were using `curl -sf` which demands a 2xx response. Changed to `curl -s --max-time 2 -o /dev/null` (exits 0 on any HTTP round-trip, including 401). The server returns 200 vs 401 on `/health` is an auth concern we don't care about during liveness probing.
+
+5. **Admin-token bootstrap: recovery endpoint only REGENERATES.** The plan assumed `influxdb3 create token --admin --regenerate --host :8182` would work as the first bootstrap. It doesn't — the recovery endpoint requires an existing admin token to regenerate. For a fresh server we must pre-generate an admin token **offline** (`influxdb3 create token --admin --offline --output-file …`) and pass it to serve via `--admin-token-file`. Implemented as a one-shot `token-bootstrap` service that runs before `influxdb3` and writes the admin token into the shared data volume. `init.sh` no longer calls the recovery endpoint.
+
+6. **Enterprise image lacks `python3` and `jq`.** `init.sh`'s JSON token parser needed to be pure shell. Replaced `python3 -c "import json; …"` with `sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'`.
+
+7. **`influxdb3` CLI puts `--host` and `--token` on subcommands, not top-level.** `influxdb3 --token X query …` fails with "unexpected argument '--token'". Correct form: `influxdb3 query … --token X`. Updated `init.sh::cli()` to append flags after the subcommand chain, and updated `make cli` / `make query` accordingly.
+
+8. **Database auto-create by first write.** The simulator writing line protocol to a non-existent database auto-creates it. By the time `init.sh` runs `create database bess` the database already exists (409 Conflict). Made all `create` calls in `init.sh` idempotent via an `idempotent` helper that treats "already exists / Conflict / 409" as success.
+
+9. **`distinct_cache` flag is `--columns` (plural), not `--column`.** Typo.
+
+10. **`make cli` needs to pre-export TOKEN.** With auth on, every CLI call needs `--token`. Added `make cli` wrapper that pre-exports `TOKEN` and installs an `iql` shell function (`iql 'SELECT …'` → `influxdb3 query --database bess --token $TOKEN …`), plus a `make query sql='…'` one-shot target. Init.sh also writes a plain-text token file (`/var/lib/influxdb3/.bess-token-plain`) alongside the JSON one for these helpers.
+
+11. **Querying the Last Value Cache is not just `SELECT ... FROM cell_last`.** Returns `table 'public.iox.cell_last' not found`. Correct syntax uses a function like `last_cache('cell_last')` or similar — to be confirmed during Task 18 (queries.py) and Task 25 (CLI_EXAMPLES.md) when we write the real query code.
 
 ## Amendments from Checkpoint #2
 
