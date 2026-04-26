@@ -331,3 +331,38 @@ Index README comparison table, decision tree, contribution guide, end-to-end lin
 - **K8s/Terraform companion artifacts**: deliberately deferred out of v1 for all eight repos. Each repo's ARCHITECTURE.md discusses the shape of a production deployment without shipping manifests. If a specific vertical proves popular, add manifests as a follow-up.
 - **Replication topology for O&G**: the detailed edge/core pattern is resolved in the O&G per-repo design, not here.
 - **Per-repo naming consistency for plugin binding arguments**: finalized during BESS pilot, then codified in `CONVENTIONS.md`.
+
+## 13. Amendment log
+
+Changes to this spec made after shipping `influxdb3-ref-bess` and `influxdb3-ref-iiot`. Each entry is something the original spec got wrong, under-specified, or just didn't anticipate.
+
+### A1 — Per-repo specs live in the per-repo docs/, not the meta-repo (2026-04-25)
+
+The original spec implied per-repo design docs would live in the meta-repo's `docs/superpowers/specs/`. Confirmed convention with iiot: **per-repo specs live in the per-repo's own `docs/superpowers/specs/`**. The meta-repo holds only portfolio-level specs. Implementation **plans** still live in the meta-repo (they're the controller's contract for execution, not a user-facing artifact).
+
+### A2 — Plugin count per repo is variable; 4 is fine when it teaches more (2026-04-25)
+
+The original spec listed exactly 3 plugins per repo (1 WAL, 1 Schedule, 1 Request). IIoT shipped 4 — two WAL plugins, intentionally — to demonstrate two different WAL patterns side-by-side: instant transition-detect (`wal_downtime_detector`) vs windowed/derivative (`wal_quality_excursion`). The plugin count is now a "minimum 3, more if it earns its keep" guideline, not a fixed contract.
+
+### A3 — Default request-trigger UI integration is browser-direct fetch with a latency badge AND history (2026-04-26)
+
+The original spec (§7.4) said "the UI has a panel that calls [the request trigger] via `fetch`, demonstrating both direct querying and Processing-Engine-mediated querying side by side." IIoT discovered the strongest version of this pattern:
+
+1. The browser calls the request endpoint **directly** (not through the FastAPI backend), measuring round-trip time client-side.
+2. The panel renders a "**served by Processing Engine: N ms**" badge using that measurement.
+3. The plugin response is shaped to drive the **entire** panel — current state plus chart history — so a single fetch is enough.
+4. No competing FastAPI partial route on the same panel.
+
+Future repos default to this shape. See `iiot/plugins/request_andon_board.py` and `iiot/ui/static/app.js` for the reference implementation.
+
+### A4 — Gotchas codified in `CONVENTIONS.md` (2026-04-26)
+
+The original spec's §12 listed "per-repo naming consistency for plugin binding arguments" as an open question to be codified after the bess pilot. Both pilots have shipped; the conventions and a pile of related gotchas (LineBuilder injection, 6-field cron, response-shape unwrapping behavior, LVC reads via TVF, DataFusion `COUNT(*)` planning limitation, `date_bin()` ns-string format, browser-facing URL separation, Starlette TemplateResponse signature, sentinel-row LVC leak, etc.) live in [`CONVENTIONS.md`](../../CONVENTIONS.md). New repos should read it before starting.
+
+### A5 — Phase 2 (template extraction) is happening incrementally, not as a discrete phase (2026-04-26)
+
+The original spec (§11) called for a discrete "Phase 2 — Template extraction" between the BESS pilot and the multi-node trailblazer. In practice, IIoT shipped before the template extraction happened, and most of the "template" is just patterns + `CONVENTIONS.md` + the ability to copy from either of the two existing repos. A discrete `template/` directory may still be worth extracting before Phase 4 (parallel build), but it's no longer a hard gate.
+
+### A6 — `CONVENTIONS.md` lives at the meta-repo root, not under `docs/` (2026-04-26)
+
+The original spec (§10) listed `CONVENTIONS.md` under `docs/superpowers/specs/`. It now lives at the meta-repo root for visibility — it's a primary artifact for repo authors, not a portfolio-design doc.
