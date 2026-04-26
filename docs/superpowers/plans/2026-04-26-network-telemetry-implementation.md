@@ -100,7 +100,7 @@ curl -i -X POST http://localhost:18181/api/v3/configure/table \
 # CLI fallback (in case the HTTP API doesn't exist or the JSON shape differs)
 docker exec nt-probe influxdb3 create database nt
 docker exec nt-probe influxdb3 create table fabric_health --database nt \
-  --tags site,layer --fields spines_up:i64 --retention-period 24h
+  --tags site,layer --fields spines_up:int64 --retention-period 24h
 ```
 
 Either the HTTP API or the CLI will work. **Phase 3's `init.sh` uses whichever responds correctly.**
@@ -1562,10 +1562,11 @@ ensure_tables() {
         --fields "in_bytes:int64,out_bytes:int64,in_pkts:int64,out_pkts:int64,in_errors:int64,in_discards:int64,optical_power_dbm:float64,ecn_marked_pkts:float64,pfc_pause_frames:float64"
 
     # bgp_sessions: per-session state (1 Hz × 128 sessions)
+    # NOTE (Phase 0 finding): CLI string field type is `utf8`, NOT `string`.
     idempotent "table bgp_sessions" create table bgp_sessions \
         --database "${INFLUX_DB}" \
         --tags site,switch,peer_switch \
-        --fields "state:string,prefixes_received:int64,uptime_s:int64"
+        --fields "state:utf8,prefixes_received:int64,uptime_s:int64"
 
     # flow_records: sampled (sFlow-like) per-flow records (~5k/s)
     idempotent "table flow_records" create table flow_records \
@@ -1581,18 +1582,20 @@ ensure_tables() {
 
     # fabric_health: rollup written by schedule_fabric_health every 5s.
     # 24h retention demonstrates per-table retention.
+    # NOTE (Phase 0 finding): CLI string field type is `utf8`, NOT `string`.
     idempotent "table fabric_health" create table fabric_health \
         --database "${INFLUX_DB}" \
         --tags site,layer \
-        --fields "status:string,spines_up:int64,leaves_up:int64,bgp_up:int64,ingress_bps:float64,egress_bps:float64,p95_latency_us:float64,ecn_pct:float64" \
+        --fields "status:utf8,spines_up:int64,leaves_up:int64,bgp_up:int64,ingress_bps:float64,egress_bps:float64,p95_latency_us:float64,ecn_pct:float64" \
         --retention-period 24h
 
     # anomalies: rows written by schedule_anomaly_detector when problems
     # are detected. No retention — historical anomalies stick around.
+    # NOTE (Phase 0 finding): CLI string field type is `utf8`, NOT `string`.
     idempotent "table anomalies" create table anomalies \
         --database "${INFLUX_DB}" \
         --tags site,severity,kind,switch,interface \
-        --fields "reason:string,value:float64,started_at_ns:float64"
+        --fields "reason:utf8,value:float64,started_at_ns:float64"
 }
 
 ensure_caches() {
@@ -1646,12 +1649,12 @@ tables immediately and there is no `__init` row to filter out.
 
 | Table | Tags | Fields | Source | Retention |
 |-------|------|--------|--------|-----------|
-| `interface_counters` | site, switch, interface | in_bytes, out_bytes, in_pkts, out_pkts, in_errors, in_discards (i64), optical_power_dbm, ecn_marked_pkts, pfc_pause_frames (f64) | simulator (1 Hz/interface) | none |
-| `bgp_sessions` | site, switch, peer_switch | state (string), prefixes_received, uptime_s (i64) | simulator (1 Hz/session) | none |
-| `flow_records` | site, src_ip, dst_ip, src_switch, dst_switch, vrf | bytes, packets (i64), duration_ms (f64) | simulator (~5 k/s sampled) | none |
-| `latency_probes` | site, src_switch, dst_switch | rtt_us (f64) | simulator (1 Hz/pair) | none |
-| `fabric_health` | site, layer | status (string), spines_up, leaves_up, bgp_up (i64), ingress_bps, egress_bps, p95_latency_us, ecn_pct (f64) | plugin (`schedule_fabric_health`) | **24 hours** |
-| `anomalies` | site, severity, kind, switch, interface | reason (string), value, started_at_ns (f64) | plugin (`schedule_anomaly_detector`) | none |
+| `interface_counters` | site, switch, interface | in_bytes, out_bytes, in_pkts, out_pkts, in_errors, in_discards (int64), optical_power_dbm, ecn_marked_pkts, pfc_pause_frames (float64) | simulator (1 Hz/interface) | none |
+| `bgp_sessions` | site, switch, peer_switch | state (utf8), prefixes_received, uptime_s (int64) | simulator (1 Hz/session) | none |
+| `flow_records` | site, src_ip, dst_ip, src_switch, dst_switch, vrf | bytes, packets (int64), duration_ms (float64) | simulator (~5 k/s sampled) | none |
+| `latency_probes` | site, src_switch, dst_switch | rtt_us (float64) | simulator (1 Hz/pair) | none |
+| `fabric_health` | site, layer | status (utf8), spines_up, leaves_up, bgp_up (int64), ingress_bps, egress_bps, p95_latency_us, ecn_pct (float64) | plugin (`schedule_fabric_health`) | **24 hours** |
+| `anomalies` | site, severity, kind, switch, interface | reason (utf8), value, started_at_ns (float64) | plugin (`schedule_anomaly_detector`) | none |
 
 ## Caches
 
