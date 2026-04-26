@@ -15,6 +15,18 @@
 - `/Users/pauldix/codez/reference_architectures/influxdb3-ref-bess/` — earlier reference; signals_base.py and vendored JS originally come from here.
 - `/Users/pauldix/codez/reference_architectures/influxdb3-reference-architectures/CONVENTIONS.md` — read before starting.
 
+## End-to-end integration testing — run for real
+
+This plan **executes the cluster end-to-end as part of verification**, not just at the user's review time. The manual checkpoints (Phase 4, Phase 7) and the final ship phase (Phase 11) actually `make up` the 5-node cluster, run both scenarios, hit the live UI, and confirm the three teaching patterns work. Code that compiles isn't enough — the repo must be **handed back fully verified**.
+
+**License:** use `INFLUXDB3_ENTERPRISE_EMAIL=paul+refiiot@influxdata.com`. This address has an existing validated Enterprise trial license — the cluster auto-picks it up from a fresh volume without needing a manual email click. Set this in `.env` before any `make up` step in the plan; it's the implementer's hard-coded email for all integration runs.
+
+**Sandbox note for the implementer:** the iiot CLAUDE.md guidance (referenced in `/Users/pauldix/codez/CLAUDE.md` § "Load Testing") applies here too — `make up` backgrounds docker-compose children, which the default Claude Code sandbox kills. Run docker-compose-touching commands with `dangerouslyDisableSandbox: true` (Bash tool flag). Also kill any stale `nt-*` containers from prior runs before each fresh `make up`:
+
+```bash
+docker ps -a --format '{{.Names}}' | grep '^nt-' | xargs -r docker rm -f 2>/dev/null
+```
+
 ---
 
 ## Phase 0 — API surface verification (READ AND VERIFY BEFORE STARTING)
@@ -2183,110 +2195,148 @@ git commit -m "feat: setup script and Makefile (5-node aware)"
 
 ---
 
-## Phase 4 — Manual validation checkpoint #1
+## Phase 4 — Integration checkpoint #1 (executed, not manual)
 
-### Task 9: First manual smoke test — cluster boots, simulator writes, retention applied
+### Task 9: First end-to-end run — cluster boots, simulator writes, retention applied
 
-This is the FIRST chance to verify Phase 0 assumptions held under real conditions. Spend the time to actually look.
+This is the FIRST chance to verify Phase 0 assumptions held under real conditions. **The implementer actually runs the cluster** (no manual click needed — `paul+refiiot@influxdata.com` auto-validates) and asserts on the outputs. Failures here amend the relevant Phase 3 task.
 
-- [ ] **Step 1: Bring up the cluster**
+**All `docker compose` / `make up` commands in this phase need `dangerouslyDisableSandbox: true` on the Bash tool call.** The default sandbox kills backgrounded children.
+
+- [ ] **Step 1: Pre-clean and write `.env`**
 
 ```bash
 cd /Users/pauldix/codez/reference_architectures/influxdb3-ref-network-telemetry
-make up
+docker ps -a --format '{{.Names}}' | grep '^nt-' | xargs -r docker rm -f 2>/dev/null
+# Wipe any prior cluster state so we start clean (license still picks up)
+docker compose down -v 2>/dev/null || true
+# Write .env directly (skip the interactive setup.sh prompt)
+cat > .env <<'EOF'
+INFLUXDB3_ENTERPRISE_EMAIL=paul+refiiot@influxdata.com
+INFLUXDB3_ENTERPRISE_LICENSE_TYPE=trial
+EOF
 ```
 
-Click the validation link in the email. Wait until **all five** InfluxDB nodes report healthy:
+- [ ] **Step 2: Bring up the cluster** (sandbox-disabled bash)
 
 ```bash
-make ps
+docker compose up -d 2>&1 | tail -10
+```
+
+- [ ] **Step 3: Wait for all 5 nodes healthy** (up to 5 min — license auto-pickup is fast but cluster init is slower than a single node)
+
+```bash
+deadline=$(($(date +%s) + 300))
+for n in nt-ingest-1 nt-ingest-2 nt-query nt-compact nt-process; do
+    while [ $(date +%s) -lt $deadline ]; do
+        if docker compose ps --format json $n 2>/dev/null | grep -q '"Health":"healthy"'; then
+            echo "$n healthy"
+            break
+        fi
+        sleep 3
+    done
+done
+docker compose ps
 # Expected: nt-ingest-1, nt-ingest-2, nt-query, nt-compact, nt-process all "healthy"
 ```
 
-This may take 60–120 seconds for the cluster to converge after license validation.
+If any node fails to become healthy, dump its logs (`docker compose logs <node> | tail -50`) and diagnose. Most common cause: license validation failing because the email isn't recognized — verify `paul+refiiot@influxdata.com` is set in `.env` and visible to compose (`docker compose config | grep INFLUXDB3_ENTERPRISE_EMAIL`).
 
-- [ ] **Step 2: Verify init completed cleanly**
-
-```bash
-docker compose logs influxdb3-init | tail -20
-# Expected:
-# [init] admin token present
-# [init] created database nt   (or "already exists")
-# [init] created table interface_counters  (or "already exists")
-# [init] created table bgp_sessions
-# [init] created table flow_records
-# [init] created table latency_probes
-# [init] created table fabric_health
-# [init] created table anomalies
-# [init] created last_cache bgp_session_last
-# [init] created distinct_cache src_ip_distinct
-# [init] created distinct_cache dst_ip_distinct
-# [init] no triggers yet (added in Task 17)
-# [init] initialization complete
-```
-
-If any line failed, this is the moment to amend init.sh / the configure API CLI invocations. The phase 0 verification should have caught most issues, but reality often differs.
-
-- [ ] **Step 3: Verify retention is set on `fabric_health`**
+- [ ] **Step 4: Assert init completed cleanly**
 
 ```bash
-make query sql='SHOW TABLES'
-# Expected: 6 tables listed
-
-make query sql="SELECT * FROM information_schema.tables WHERE table_name = 'fabric_health'"
-# Or use the influxdb3 CLI's "show table fabric_health" if information_schema doesn't expose retention.
-docker compose exec influxdb3-query bash -lc 'TOKEN=$(cat /var/lib/influxdb3/.nt-token-plain); influxdb3 show table fabric_health --database nt --token "$TOKEN"'
-# Expected: 24h retention period reported.
+docker compose logs influxdb3-init 2>&1 | tail -20
+# Required lines (some may say "already exists"):
+#   [init] admin token present
+#   [init] created database nt
+#   [init] created table interface_counters
+#   [init] created table bgp_sessions
+#   [init] created table flow_records
+#   [init] created table latency_probes
+#   [init] created table fabric_health
+#   [init] created table anomalies
+#   [init] created last_cache bgp_session_last
+#   [init] created distinct_cache src_ip_distinct
+#   [init] created distinct_cache dst_ip_distinct
+#   [init] initialization complete
 ```
 
-If retention isn't showing, amend init.sh to use the correct flag.
+If "initialization complete" doesn't appear, init.sh failed mid-way. Find the FATAL line, amend the relevant `idempotent` call (likely a configure-API field name or CLI flag mismatch), and re-run from Step 1.
 
-- [ ] **Step 4: Verify simulator is writing — both ingest nodes receiving traffic**
+- [ ] **Step 5: Assert retention is set on `fabric_health`**
 
 ```bash
-docker compose logs simulator | tail -10
-# Expected: tick=N t=Ns flows/tick=5000 lines
-
-make query sql="SELECT COUNT(*) FROM interface_counters WHERE time > now() - INTERVAL '1 minute'"
-# Expected: thousands (~1024 interfaces × ~60 ticks/min)
-
-make query sql="SELECT COUNT(*) FROM flow_records WHERE time > now() - INTERVAL '1 minute'"
-# Expected: hundreds of thousands (~5k/sec × 60s)
-
-make query sql="SELECT COUNT(*) FROM bgp_sessions WHERE time > now() - INTERVAL '1 minute'"
-# Expected: ~7,680 (128 sessions × ~60 ticks)
+docker compose exec -T influxdb3-query bash -lc \
+  'TOKEN=$(cat /var/lib/influxdb3/.nt-token-plain); influxdb3 show table fabric_health --database nt --token "$TOKEN"' 2>&1
+# Expected: output contains "24h" or "86400" (seconds) for retention.
 ```
 
-To verify both ingest nodes are receiving traffic, look at write-request metrics on each (assuming such an endpoint exists; otherwise log into each and `tail -f` and look for write activity):
+If retention isn't showing, the `--retention-period` flag or its configure-API equivalent isn't being applied — fix init.sh's `ensure_tables` for fabric_health.
+
+- [ ] **Step 6: Assert simulator is writing to BOTH ingest nodes**
+
+Wait 30s for the simulator to ramp up:
 
 ```bash
-docker compose logs influxdb3-ingest-1 2>&1 | grep -c "write_lp"
-docker compose logs influxdb3-ingest-2 2>&1 | grep -c "write_lp"
-# Both should be non-zero and roughly comparable (round-robin per batch).
+sleep 30
+docker compose logs simulator 2>&1 | tail -10
+# Expected: lines like "tick=N t=Ns flows/tick=5000"
+
+# Token for SQL queries
+TOKEN=$(docker compose exec -T influxdb3-query cat /var/lib/influxdb3/.nt-token-plain | tr -d '\r\n')
+
+_q() {
+  curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+       -H "Content-Type: application/json" \
+       http://localhost:8181/api/v3/query_sql \
+       -d "{\"db\":\"nt\",\"q\":\"$1\",\"format\":\"json\"}"
+}
+
+_q "SELECT COUNT(*) AS n FROM interface_counters WHERE time > now() - INTERVAL '1 minute'"
+# Expected: n > 30000 (~1024 interfaces × ~60 ticks/min)
+
+_q "SELECT COUNT(*) AS n FROM flow_records WHERE time > now() - INTERVAL '1 minute'"
+# Expected: n > 100000 (~5k/sec × 60s)
+
+_q "SELECT COUNT(*) AS n FROM bgp_sessions WHERE time > now() - INTERVAL '1 minute'"
+# Expected: n > 5000 (128 sessions × ~60 ticks/min)
 ```
 
-- [ ] **Step 5: Verify the LVC + DVC**
+Verify BOTH ingest nodes accepted writes (round-robin proof):
 
 ```bash
-# LVC: should return 128 rows (one per BGP session)
-make query sql="SELECT COUNT(*) FROM last_cache('bgp_sessions', 'bgp_session_last')"
-
-# DVC: should be in the thousands after a minute of flow records
-make query sql="SELECT COUNT(*) FROM distinct_cache('flow_records', 'src_ip_distinct')"
+docker compose logs influxdb3-ingest-1 2>&1 | grep -c "write_lp\|wrote\|points received" || echo 0
+docker compose logs influxdb3-ingest-2 2>&1 | grep -c "write_lp\|wrote\|points received" || echo 0
+# Both counts should be > 0. If one is 0, the round-robin isn't working —
+# check SIM_INGEST_URLS env var on the simulator container.
 ```
 
-- [ ] **Step 6: Tear down without losing the validated license**
+- [ ] **Step 7: Assert LVC + DVC are populated**
 
 ```bash
-make down
-make up   # should NOT prompt for re-validation
+_q "SELECT COUNT(*) AS n FROM last_cache('bgp_sessions', 'bgp_session_last')"
+# Expected: n = 128 (one per BGP session)
+
+_q "SELECT COUNT(*) AS n FROM distinct_cache('flow_records', 'src_ip_distinct')"
+# Expected: n > 100 (simulator generates ~1600 distinct IPs across 16 leaves)
 ```
 
-- [ ] **Step 7: Note any issues**
+- [ ] **Step 8: Verify license persists across down/up**
 
-If anything didn't work as expected, write notes/checkpoint1.md (gitignored) describing the gap and amend the relevant Phase 3 task. Re-run this checkpoint after the fix.
+```bash
+docker compose down  # preserves volume
+sleep 5
+docker compose up -d 2>&1 | tail -5
+sleep 60  # let cluster come back up
+docker compose ps --format 'table {{.Name}}\t{{.Status}}' | grep nt-
+# Expected: all 5 nodes healthy without re-validation; volume preserved license.
+```
 
-Once everything checks out, **leave the cluster up** — Phase 5 (scenarios) and the rest of the implementation can run against it without restarting.
+- [ ] **Step 9: Outcome**
+
+If every step passed, this checkpoint is green — **leave the cluster running** so Phase 5 (scenarios) and Phase 7 can use it without restart.
+
+If any step failed, fix the underlying issue (likely a Phase 3 task — init.sh, compose, or env var), commit the fix, then re-run this checkpoint from Step 1.
 
 ---
 
@@ -3834,84 +3884,158 @@ git commit -m "feat(influxdb): register the four processing-engine triggers in i
 
 ---
 
-## Phase 7 — Manual validation checkpoint #2
+## Phase 7 — Integration checkpoint #2 (executed)
 
 ### Task 19: Verify the full end-to-end data flow with plugins active
 
-- [ ] **Step 1: Recreate the cluster so init.sh re-runs**
+The cluster is still running from Phase 4. We need init.sh to re-run with the new trigger registrations from Task 18, so cycle the cluster.
+
+**All `docker compose` commands here need `dangerouslyDisableSandbox: true`.**
+
+- [ ] **Step 1: Recycle the cluster so init.sh re-runs the new triggers**
 
 ```bash
 cd /Users/pauldix/codez/reference_architectures/influxdb3-ref-network-telemetry
-make down && make up
-make ps  # wait for all 5 InfluxDB nodes to be healthy
+docker compose down
+sleep 5
+docker compose up -d 2>&1 | tail -5
+
+# Wait for all 5 nodes healthy + init complete
+deadline=$(($(date +%s) + 300))
+for n in nt-ingest-1 nt-ingest-2 nt-query nt-compact nt-process; do
+    while [ $(date +%s) -lt $deadline ]; do
+        if docker compose ps --format json $n 2>/dev/null | grep -q '"Health":"healthy"'; then break; fi
+        sleep 3
+    done
+done
+
+# Wait for init container to complete
+while [ $(date +%s) -lt $deadline ]; do
+    if docker compose ps --format json influxdb3-init 2>/dev/null | grep -q '"State":"exited"'; then break; fi
+    sleep 3
+done
+
+docker compose logs influxdb3-init 2>&1 | tail -10
+# Expected: trigger creation lines + "initialization complete"
 ```
 
-- [ ] **Step 2: Confirm triggers are registered AND running**
+- [ ] **Step 2: Assert all 4 triggers registered and enabled**
 
 ```bash
-make query sql='SHOW TRIGGERS'
-# Or via CLI:
-docker compose exec influxdb3-query bash -lc 'TOKEN=$(cat /var/lib/influxdb3/.nt-token-plain); influxdb3 show trigger --database nt --token "$TOKEN"'
-# Expected: four triggers — fabric_health, anomaly_detector, top_talkers, src_ip_detail; all enabled.
+TOKEN=$(docker compose exec -T influxdb3-query cat /var/lib/influxdb3/.nt-token-plain | tr -d '\r\n')
+docker compose exec -T influxdb3-query bash -lc \
+  "influxdb3 show trigger --database nt --token $TOKEN" 2>&1 | tee /tmp/triggers.out
+# Expected: 4 triggers listed — fabric_health, anomaly_detector, top_talkers, src_ip_detail.
+grep -c "fabric_health\|anomaly_detector\|top_talkers\|src_ip_detail" /tmp/triggers.out
+# Expected: 4
 ```
 
-Look for evidence the schedule plugins are actually firing:
+If any trigger is missing or disabled, fix init.sh's `ensure_triggers` and re-run from Step 1.
+
+- [ ] **Step 3: Wait for schedule plugins to start firing, then assert fabric_health rows**
 
 ```bash
-docker compose logs influxdb3-process | grep -E "fabric_health|anomaly_detector" | tail -10
-# Expected: every-5s log lines from both schedule plugins.
+sleep 60  # 12 ticks at every:5s for both schedule plugins
 
-make query sql="SELECT COUNT(*) FROM fabric_health WHERE time > now() - INTERVAL '1 minute'"
-# Expected: ~12 (5s cadence × 60s = 12, possibly 4 per tick × 12 = 48 if we emit per-layer rows)
+_q() {
+  curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+       -H "Content-Type: application/json" \
+       http://localhost:8181/api/v3/query_sql \
+       -d "{\"db\":\"nt\",\"q\":\"$1\",\"format\":\"json\"}"
+}
+
+_q "SELECT COUNT(*) AS n FROM fabric_health WHERE time > now() - INTERVAL '1 minute'"
+# Expected: n > 30 (4 layer rows × ~12 ticks/min = 48; allow slack)
+
+# Check the actual status values being written
+_q "SELECT layer, status, spines_up, leaves_up, bgp_up FROM fabric_health WHERE layer='plant' ORDER BY time DESC LIMIT 1"
+# Expected: status="healthy", bgp_up=128 (or close), spines_up=8, leaves_up=16
 ```
 
-If no rows appear, the plugin write-back isn't working. Common causes:
-- `_writeback.py` can't find the token file (check the env vars on the process node match the volume mount)
-- Process node can't reach `nt-ingest-1` (check `docker compose exec influxdb3-process curl http://nt-ingest-1:8181/health`)
-- Plugin error before write-back (check `docker compose logs influxdb3-process` for Python tracebacks)
-
-- [ ] **Step 3: Run the congestion scenario and verify anomalies are detected**
+If fabric_health is empty after 60s, the plugin write-back path is broken:
 
 ```bash
-make scenario name=congestion_hotspot
-# After ~70s:
-make query sql="SELECT time, kind, severity, switch, interface, reason FROM anomalies WHERE switch='leaf-07' ORDER BY time DESC LIMIT 5"
-# Expected: at least one row with kind='high_util', severity='critical', reason='util=0.94'
-# Followed (after the scenario's recovery) by a row with severity='info', reason='cleared'
+docker compose logs influxdb3-process 2>&1 | grep -iE "error|traceback|fabric_health" | tail -20
+# Look for: Python tracebacks, "ConnectionError", "Token not found"
+
+# Verify process node can reach ingest-1
+docker compose exec -T influxdb3-process curl -s -o /dev/null -w '%{http_code}\n' \
+    http://nt-ingest-1:8181/health
+# Expected: 401 (means reachable, just needs auth — fine)
 ```
 
-- [ ] **Step 4: Verify the request triggers via curl**
+- [ ] **Step 4: Run congestion_hotspot — assert anomaly fires**
 
 ```bash
-TOKEN=$(docker compose exec influxdb3-query bash -lc 'cat /var/lib/influxdb3/.nt-token-plain' | tr -d '\r\n')
+docker compose --profile scenarios run --rm \
+  -e SCENARIO=congestion_hotspot scenarios 2>&1 | tail -10
+# Should print "[scenario step 5] DONE" and exit 0
 
-# top_talkers
-curl -s -H "Authorization: Bearer ${TOKEN}" \
-     -X POST http://localhost:8181/api/v3/engine/top_talkers \
-     -H "Content-Type: application/json" \
-     -d '{"window_minutes": 5, "limit": 10}' | python3 -m json.tool | head -20
-# Expected: JSON with {"talkers": [...]}; non-empty after a minute of simulator + scenario activity.
+sleep 10  # let anomaly_detector's next 5s tick fire after the 30s sustain
 
-# src_ip_detail
-make scenario name=east_west_burst
-sleep 35  # let the burst run + complete
+_q "SELECT time, kind, severity, switch, interface, reason FROM anomalies WHERE switch='leaf-07' AND interface='et-0/0/12' ORDER BY time DESC LIMIT 5"
+# Expected: at least one row with kind="high_util", severity="critical"
+# After scenario recovery: also a row with severity="info", reason="cleared"
+```
+
+If the high_util anomaly didn't fire, the detector's window query is wrong — check `_detect_high_util` in `schedule_anomaly_detector.py`.
+
+- [ ] **Step 5: Run east_west_burst — assert src_ip_detail returns the spike**
+
+```bash
+docker compose --profile scenarios run --rm \
+  -e SCENARIO=east_west_burst scenarios 2>&1 | tail -5
+# Should print "[scenario step 4] DONE"
+
+sleep 5
+
+# Typeahead via DVC
+_q "SELECT src_ip FROM distinct_cache('flow_records', 'src_ip_distinct') WHERE src_ip LIKE '10.4%' LIMIT 20" \
+  | tee /tmp/typeahead.out
+grep -q "10.4.7.91" /tmp/typeahead.out && echo "✓ typeahead found 10.4.7.91" || echo "✗ MISSING"
+
+# src_ip_detail plugin
 curl -s -H "Authorization: Bearer ${TOKEN}" \
      -X POST http://localhost:8181/api/v3/engine/src_ip_detail \
      -H "Content-Type: application/json" \
-     -d '{"src_ip": "10.4.7.91"}' | python3 -m json.tool | head -30
-# Expected: JSON with sparkline (≥ 1 entry), top_destinations (5 entries), leaf_distribution, ecn_pct.
+     -d '{"src_ip": "10.4.7.91"}' | tee /tmp/detail.json | python3 -m json.tool | head -40
+# Expected: JSON with src_ip="10.4.7.91", non-empty sparkline, top_destinations (5 entries),
+# leaf_distribution, ecn_pct.
+
+python3 -c '
+import json
+d = json.load(open("/tmp/detail.json"))
+b = d.get("body", d)
+assert b.get("src_ip") == "10.4.7.91", f"src_ip mismatch: {b}"
+assert len(b.get("sparkline", [])) > 0, "empty sparkline"
+assert len(b.get("top_destinations", [])) > 0, "empty top_destinations"
+print("✓ src_ip_detail OK")
+'
 ```
 
-- [ ] **Step 5: Verify the DVC drives typeahead**
+- [ ] **Step 6: Hit the top_talkers plugin — assert non-empty payload**
 
 ```bash
-make query sql="SELECT * FROM distinct_cache('flow_records', 'src_ip_distinct') WHERE src_ip LIKE '10.4%' LIMIT 20"
-# Expected: includes 10.4.7.91 (from the burst scenario) and other 10.4.x.x IPs from the simulator.
+curl -s -H "Authorization: Bearer ${TOKEN}" \
+     -X POST http://localhost:8181/api/v3/engine/top_talkers \
+     -H "Content-Type: application/json" \
+     -d '{"window_minutes": 5, "limit": 10}' | tee /tmp/talkers.json | python3 -m json.tool | head -30
+
+python3 -c '
+import json
+d = json.load(open("/tmp/talkers.json"))
+b = d.get("body", d)
+talkers = b.get("talkers", [])
+assert len(talkers) > 0, "empty talkers list"
+print(f"✓ top_talkers returned {len(talkers)} entries; top src_ip = {talkers[0][\"src_ip\"]}")
+'
 ```
 
-- [ ] **Step 6: Note any issues**
+- [ ] **Step 7: Outcome**
 
-If anything failed, fix the underlying plugin/init.sh/scenario before continuing. Capture amendments in notes/checkpoint2.md.
+If every assertion passed, the plugin layer is fully integrated. **Leave the cluster running** — Phase 8 (UI) builds against it. The integration test in Phase 11 will exercise the UI end-to-end.
+
+If any step failed, fix the underlying plugin / init.sh / writeback issue, commit, recycle, re-run this checkpoint.
 
 ---
 
@@ -6077,37 +6201,178 @@ git commit -m "docs: scripted demo + polished README"
 
 ## Phase 11 — Ship to GitHub + meta-repo CONVENTIONS amendments
 
-### Task 28: Final lint + test pass
+### Task 28: Final lint + full integration run
 
-- [ ] **Step 1: Run linters and fix**
+The integration run actually executes the full demo end-to-end (cluster up → UI loads → both scenarios fire → all three teaching patterns return data → tear down). This is what makes the handoff worth your review time. **All `docker compose` / `make` calls in this task need `dangerouslyDisableSandbox: true`.**
+
+- [ ] **Step 1: Run linters and commit fixes**
 
 ```bash
 cd /Users/pauldix/codez/reference_architectures/influxdb3-ref-network-telemetry
 source .venv/bin/activate
-ruff check . && ruff format --check . || (ruff check --fix . && ruff format .)
+ruff check --fix . && ruff format .
 ruff check . && ruff format --check .
-git add -A
-git diff --cached --stat | head -5
-git commit -m "chore: ruff lint/format pass" || true
+# If anything moved:
+if ! git diff --quiet; then
+    git add -A
+    git commit -m "chore: ruff lint/format pass"
+fi
 ```
 
-- [ ] **Step 2: Run unit + scenario tests**
+- [ ] **Step 2: Run unit tests — must all pass**
 
 ```bash
-make test-unit
-# Expected: all unit tests pass
-
-make test-scenarios
-# Expected: pass with Docker available, or skip cleanly. Tier 2 may need
-# iteration of conftest.py if the cluster doesn't reach ready in time.
+pytest tests -q -m "not scenario and not smoke" 2>&1 | tail -10
+# Expected: every test passes; no failures, no errors.
 ```
 
-- [ ] **Step 3: Confirm clean tree**
+If any unit test fails, fix it before proceeding. Don't ship a repo with red tests.
+
+- [ ] **Step 3: Wipe state and run a clean integration boot**
 
 ```bash
+docker ps -a --format '{{.Names}}' | grep '^nt-' | xargs -r docker rm -f 2>/dev/null
+docker compose down -v 2>/dev/null || true
+cat > .env <<'EOF'
+INFLUXDB3_ENTERPRISE_EMAIL=paul+refiiot@influxdata.com
+INFLUXDB3_ENTERPRISE_LICENSE_TYPE=trial
+EOF
+
+docker compose up -d 2>&1 | tail -5
+
+# Wait for all 5 nodes healthy
+deadline=$(($(date +%s) + 300))
+ok=0
+while [ $(date +%s) -lt $deadline ]; do
+    healthy=$(docker compose ps --format json | grep -o '"Health":"healthy"' | wc -l)
+    if [ "$healthy" -ge 5 ]; then ok=1; break; fi
+    sleep 5
+done
+[ $ok -eq 1 ] || { docker compose logs --tail 20; exit 1; }
+docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+
+# Wait for init to complete
+sleep 15
+docker compose logs influxdb3-init 2>&1 | tail -5
+docker compose logs influxdb3-init 2>&1 | grep -q "initialization complete" || \
+    { echo "init failed"; docker compose logs influxdb3-init; exit 1; }
+```
+
+- [ ] **Step 4: Let simulator + schedule plugins generate data, then assert basic health**
+
+```bash
+sleep 60  # 1 minute of simulator + 12 schedule plugin ticks
+
+TOKEN=$(docker compose exec -T influxdb3-query cat /var/lib/influxdb3/.nt-token-plain | tr -d '\r\n')
+_q() {
+  curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+       -H "Content-Type: application/json" \
+       http://localhost:8181/api/v3/query_sql \
+       -d "{\"db\":\"nt\",\"q\":\"$1\",\"format\":\"json\"}"
+}
+
+# Each of these prints "✓ <thing> OK" or fails the integration run
+python3 - <<PY
+import json, subprocess
+def q(sql):
+    r = subprocess.run(["curl","-s","-X","POST","-H",f"Authorization: Bearer $TOKEN".replace("\$TOKEN","${TOKEN}"),"-H","Content-Type: application/json","http://localhost:8181/api/v3/query_sql","-d",json.dumps({"db":"nt","q":sql,"format":"json"})], capture_output=True, text=True)
+    return json.loads(r.stdout) if r.stdout.strip() else []
+PY
+
+# Simpler: shell asserts
+n=$(_q "SELECT COUNT(*) AS n FROM interface_counters WHERE time > now() - INTERVAL '1 minute'" | grep -oE '"n":[0-9]+' | head -1 | cut -d: -f2)
+[ "$n" -gt 30000 ] && echo "✓ interface_counters: $n rows in last 1m" || { echo "✗ interface_counters: only $n rows"; exit 1; }
+
+n=$(_q "SELECT COUNT(*) AS n FROM flow_records WHERE time > now() - INTERVAL '1 minute'" | grep -oE '"n":[0-9]+' | head -1 | cut -d: -f2)
+[ "$n" -gt 100000 ] && echo "✓ flow_records: $n rows in last 1m" || { echo "✗ flow_records: only $n rows"; exit 1; }
+
+n=$(_q "SELECT COUNT(*) AS n FROM fabric_health WHERE time > now() - INTERVAL '1 minute'" | grep -oE '"n":[0-9]+' | head -1 | cut -d: -f2)
+[ "$n" -ge 30 ] && echo "✓ fabric_health: $n rows from schedule plugin" || { echo "✗ schedule plugin not firing"; exit 1; }
+
+n=$(_q "SELECT COUNT(*) AS n FROM last_cache('bgp_sessions','bgp_session_last')" | grep -oE '"n":[0-9]+' | head -1 | cut -d: -f2)
+[ "$n" -ge 100 ] && echo "✓ LVC: $n BGP sessions" || { echo "✗ LVC not populated"; exit 1; }
+```
+
+- [ ] **Step 5: UI loads and shows data**
+
+```bash
+curl -s -o /tmp/ui.html -w 'HTTP=%{http_code}\n' http://localhost:8080/
+[ "$(grep -c 'Network Telemetry\|fabric' /tmp/ui.html)" -gt 0 ] || { echo "✗ UI root missing expected text"; exit 1; }
+echo "✓ UI root loads"
+
+# FastAPI partials respond
+for partial in fabric_state kpi_row throughput anomalies; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/partials/$partial)
+    [ "$code" = "200" ] && echo "✓ /partials/$partial → 200" || { echo "✗ /partials/$partial → $code"; exit 1; }
+done
+```
+
+- [ ] **Step 6: Run congestion_hotspot scenario — assert anomaly visible**
+
+```bash
+docker compose --profile scenarios run --rm \
+  -e SCENARIO=congestion_hotspot scenarios 2>&1 | tail -5
+sleep 10  # next anomaly_detector tick
+
+n=$(_q "SELECT COUNT(*) AS n FROM anomalies WHERE switch='leaf-07' AND kind='high_util' AND time > now() - INTERVAL '5 minutes'" | grep -oE '"n":[0-9]+' | head -1 | cut -d: -f2)
+[ "$n" -ge 1 ] && echo "✓ congestion_hotspot fired high_util anomaly ($n rows)" || { echo "✗ no anomaly"; exit 1; }
+```
+
+- [ ] **Step 7: Run east_west_burst — assert typeahead + detail plugin work**
+
+```bash
+docker compose --profile scenarios run --rm \
+  -e SCENARIO=east_west_burst scenarios 2>&1 | tail -5
+sleep 5
+
+# DVC typeahead
+_q "SELECT src_ip FROM distinct_cache('flow_records', 'src_ip_distinct') WHERE src_ip LIKE '10.4%' LIMIT 20" \
+  | grep -q '"src_ip":"10.4.7.91"' && echo "✓ typeahead found 10.4.7.91" || { echo "✗ DVC missed burst source"; exit 1; }
+
+# src_ip_detail plugin
+curl -s -H "Authorization: Bearer ${TOKEN}" \
+     -X POST http://localhost:8181/api/v3/engine/src_ip_detail \
+     -H "Content-Type: application/json" \
+     -d '{"src_ip": "10.4.7.91"}' > /tmp/detail.json
+python3 -c '
+import json
+d = json.load(open("/tmp/detail.json"))
+b = d.get("body", d)
+assert b.get("src_ip") == "10.4.7.91", f"bad src_ip: {b}"
+assert len(b.get("sparkline", [])) > 0, "empty sparkline"
+assert len(b.get("top_destinations", [])) > 0, "empty top_destinations"
+print(f"✓ src_ip_detail: sparkline {len(b[\"sparkline\"])} points, {len(b[\"top_destinations\"])} dests")
+'
+```
+
+- [ ] **Step 8: top_talkers plugin returns non-empty results**
+
+```bash
+curl -s -H "Authorization: Bearer ${TOKEN}" \
+     -X POST http://localhost:8181/api/v3/engine/top_talkers \
+     -H "Content-Type: application/json" \
+     -d '{"window_minutes": 5, "limit": 10}' > /tmp/talkers.json
+python3 -c '
+import json
+d = json.load(open("/tmp/talkers.json"))
+b = d.get("body", d)
+talkers = b.get("talkers", [])
+assert len(talkers) > 0, f"empty talkers: {b}"
+print(f"✓ top_talkers: {len(talkers)} rows, top src_ip = {talkers[0][\"src_ip\"]}")
+'
+```
+
+- [ ] **Step 9: Tear down (preserve volume) — repo is verified working**
+
+```bash
+docker compose down
 git status --short
-# Expected: empty
+# Expected: empty (clean tree)
 ```
+
+If every assertion above passed, the repo is fully verified and ready for the user's review.
+
+If anything failed mid-run, capture the failure mode in `notes/integration-failure.md`, fix the root cause, commit, and re-run this entire task from Step 3.
 
 ### Task 29: Create GitHub repo, push, update meta repo
 
@@ -6292,17 +6557,37 @@ Open the meta-repo README on GitHub; confirm the network-telemetry row links to 
 
 ---
 
-## Self-review checklist (run after completing all tasks above)
+## Done-condition (integration-tested handoff)
 
-- [ ] All 29 tasks have green commits in the network-telemetry repo and (for Task 29) the meta repo.
-- [ ] `make test-unit` passes locally.
-- [ ] `make test-scenarios` passes locally (or skips cleanly without Docker).
-- [ ] `make demo` runs end-to-end without manual intervention (after license-validation click).
-- [ ] The dashboard at `http://localhost:8080` shows live data; all three latency badges (FastAPI, DVC, request plugin) update.
-- [ ] `congestion_hotspot` produces a visible `high_util` anomaly in the active-anomalies panel; banner flips DEGRADED.
-- [ ] `east_west_burst` populates the DVC; typeahead "10.4" returns `10.4.7.91` in <10 ms; detail panel shows the spike.
-- [ ] Phase 0 findings are reflected in the implementation (mode flags work, configure API works, `every:5s` works, `last_cache`/`distinct_cache` TVFs work).
-- [ ] The portfolio-spec success criteria (in `influxdb3-reference-architectures/docs/superpowers/specs/2026-04-23-reference-architectures-portfolio-design.md` § 3) are all met for the multi-node case.
-- [ ] CONVENTIONS.md amendments capture the new patterns this repo introduced.
+By the time the implementer hands the repo back, **every item below has been observed to pass** as part of executing the plan — they are not just self-review checkpoints, they are the actual gate before push to GitHub.
 
-If any item fails, fix and amend the relevant task in this plan with an Amendment block at the bottom of the file (matching the bess/iiot precedent).
+Phase 4 (Task 9) confirms:
+- [ ] All 5 InfluxDB nodes reach `healthy` with `paul+refiiot@influxdata.com` license auto-validation.
+- [ ] `init.sh` creates DB + 6 tables (via configure API) + LVC + 2 DVCs cleanly.
+- [ ] 24h retention is reported on `fabric_health`.
+- [ ] Both ingest nodes accept writes (round-robin verified in their logs).
+- [ ] LVC populated with 128 BGP sessions; DVC has > 100 distinct src_ips.
+- [ ] License persists across `down` / `up`.
+
+Phase 7 (Task 19) confirms:
+- [ ] All 4 triggers registered + enabled (`fabric_health`, `anomaly_detector`, `top_talkers`, `src_ip_detail`).
+- [ ] Schedule plugins firing — `fabric_health` table grows at the every:5s cadence.
+- [ ] `congestion_hotspot` writes a `high_util` anomaly via the schedule plugin's cross-node httpx write-back.
+- [ ] `east_west_burst` populates the DVC; `request_src_ip_detail` returns the burst source's composite payload.
+- [ ] `request_top_talkers` returns a non-empty list.
+
+Phase 11 (Task 28) confirms (final clean run, fresh state, full demo):
+- [ ] Lint clean; all unit tests pass.
+- [ ] Cluster boots from clean state (license auto-picked up).
+- [ ] FastAPI UI partials all return 200; root page contains expected text.
+- [ ] `congestion_hotspot` end-to-end produces visible anomaly via the API.
+- [ ] `east_west_burst` end-to-end produces visible typeahead match + detail-panel data.
+- [ ] `top_talkers` plugin returns data.
+- [ ] All three teaching patterns (FastAPI / direct SQL / request plugin) confirmed by curl.
+- [ ] Cluster shuts down cleanly.
+
+Phase 11 (Task 29) confirms:
+- [ ] GitHub repo `influxdata/influxdb3-ref-network-telemetry` is public and contains main with all commits.
+- [ ] Meta-repo README reflects ✅ Available; CONVENTIONS amendments are present and pushed.
+
+**If any item fails during execution, the implementer halts, fixes the root cause, commits, and re-runs the failed phase before continuing.** The repo is not handed back until every item is green.
