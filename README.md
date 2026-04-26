@@ -14,7 +14,7 @@ Both benefit from the same property: reading two files (`README.md` and `ARCHITE
 | # | Repo | Vertical | Status |
 |---|------|----------|--------|
 | 1 | [`influxdb3-ref-bess`](https://github.com/influxdata/influxdb3-ref-bess) | Battery Energy Storage Systems | ✅ Available |
-| 2 | `influxdb3-ref-iiot` | IIoT / Factory Floor Monitoring | 🚧 Coming soon |
+| 2 | [`influxdb3-ref-iiot`](https://github.com/influxdata/influxdb3-ref-iiot) | IIoT / Factory Floor Monitoring | ✅ Available |
 | 3 | `influxdb3-ref-network-telemetry` | Network Telemetry | 🚧 Coming soon |
 | 4 | `influxdb3-ref-renewables` | Renewable Energy (Solar + Wind) | 🚧 Coming soon |
 | 5 | `influxdb3-ref-ev-charging` | EV Charging Network | 🚧 Coming soon |
