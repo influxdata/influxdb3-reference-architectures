@@ -366,3 +366,36 @@ The original spec (§11) called for a discrete "Phase 2 — Template extraction"
 ### A6 — `CONVENTIONS.md` lives at the meta-repo root, not under `docs/` (2026-04-26)
 
 The original spec (§10) listed `CONVENTIONS.md` under `docs/superpowers/specs/`. It now lives at the meta-repo root for visibility — it's a primary artifact for repo authors, not a portfolio-design doc.
+
+### A7 — Multi-node trailblazer shipped: new conventions for clustered repos (2026-04-26)
+
+`influxdb3-ref-network-telemetry` shipped as the multi-node trailblazer (Phase 3 of §11). Lessons captured in `CONVENTIONS.md` for any subsequent clustered repo (Fleet, Data Center):
+
+- **Shared `influxdb-data` named volume** across every InfluxDB node provides catalog + object-store consistency without coordination.
+- **Mode flags** are real and stable: `ingest`, `query`, `compact`, `process,query`. Setting `--plugin-dir` adds `process` mode automatically.
+- **All InfluxDB nodes mount the plugin directory** — even nodes that don't execute plugins validate every catalog trigger's plugin path at startup. Each node also needs its own `--virtual-env-location` inside the data volume.
+- **Schedule plugin write-back via httpx** (not `LineBuilder`) when the plugin runs on a process-only node. Shared `plugins/_writeback.py` does round-robin to ingest URLs with one fallback hop.
+- **Trigger `--node-spec "nodes:<node-id>"`** required: the catalog default is `node_spec: All`, which means every node tries to execute the trigger.
+- **Bring up the query node first** so it validates the trial license alone, then the others read it from the cached object-store path. Eliminates simultaneous-license-server-burst 500s.
+- **Healthchecks must include the admin token** — `/health` requires auth in current Enterprise; the prior pattern of "any HTTP roundtrip including 401 = healthy" no longer works. `token-bootstrap` now writes a plain-text token alongside the JSON file for healthchecks to read.
+- **Demo wait loops use `docker inspect`, not `docker compose ps`** — the former accepts container names; the latter only accepts service names.
+
+### A8 — Configure-API table creation supersedes the sentinel-row pattern (2026-04-26)
+
+`influxdb3-ref-network-telemetry` introduced explicit table creation via `POST /api/v3/configure/table` (or `influxdb3 create table`) at init time, declaring the full tag/field schema and any per-table retention up front. This is **strictly better** than bess/iiot's sentinel-row trick:
+
+- Tables become real catalog objects with declared schema before caches and triggers reference them.
+- No `__init` row leaks into LVC/DVC reads. No `WHERE site <> '__init'` filter needed downstream.
+- Per-table retention can be set at create time (demonstrated on `fabric_health` with 24h).
+
+CLI field-type names: `int64`, `uint64`, `float64`, `utf8`, `bool` (NOT line-protocol shorthand `i64`/`string`). New repos use this pattern; bess and iiot can be migrated as a follow-up.
+
+### A9 — Three patterns for feeding a UI panel, side-by-side (2026-04-26)
+
+The portfolio's UI integration story expanded from "Request trigger or SQL through backend?" (Amendment A3) to three explicit patterns demonstrated together in `influxdb3-ref-network-telemetry`, each with its own latency badge:
+
+1. **SQL via FastAPI backend** — for HTML fragments swapped by HTMX.
+2. **SQL from browser direct to query node** — for cache-speed demos (DVC TVF typeahead).
+3. **Request plugin from browser direct to query node** — for composite shaped payloads.
+
+Future repos with a UI should default to showing all three when the domain warrants — the contrast is the lesson.

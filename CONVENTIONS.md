@@ -1,6 +1,6 @@
 # Conventions and gotchas
 
-Patterns and gotchas that hold across every reference-architecture repo in this portfolio. These are the lessons captured from shipping `influxdb3-ref-bess` (the pilot) and `influxdb3-ref-iiot` (the second). Read this before starting a new repo or copy-pasting a pattern from one of the existing ones.
+Patterns and gotchas that hold across every reference-architecture repo in this portfolio. These are the lessons captured from shipping `influxdb3-ref-bess` (the pilot), `influxdb3-ref-iiot` (the second), and `influxdb3-ref-network-telemetry` (the multi-node trailblazer). Read this before starting a new repo or copy-pasting a pattern from one of the existing ones.
 
 For the higher-level portfolio design, see [`docs/superpowers/specs/2026-04-23-reference-architectures-portfolio-design.md`](docs/superpowers/specs/2026-04-23-reference-architectures-portfolio-design.md).
 
@@ -32,14 +32,41 @@ For unit tests, monkeypatch a fake into the plugin module's namespace:
 monkeypatch.setattr(mod, "LineBuilder", FakeLineBuilder, raising=False)
 ```
 
-### Cron strings are SIX fields
+### Schedule trigger format: `every:` vs `cron:`
 
-`<sec> <min> <hour> <dom> <mon> <dow>`. Not the five-field Unix format.
+Two formats supported. Pick whichever matches the cadence.
+
+- **`every:<duration>`** — interval string (`every:5s`, `every:1m`, `every:1h`). Use for short, regular cadences (heartbeats, live rollups). No alignment to wall-clock time. Example: `influxdb3-ref-network-telemetry` uses `every:5s` for both schedule plugins.
+- **`cron:<sec> <min> <hour> <dom> <mon> <dow>`** — 6-field cron (NOT the 5-field Unix format). Use when the cadence must align to time-of-day (shift boundaries, daily rollups). Example: `influxdb3-ref-iiot` uses `cron:0 0 6,14,22 * * *` for shift summaries; `influxdb3-ref-bess` uses `cron:0 5 0 * * *` for daily SoH.
+
+Cron-format mistakes:
 
 | Goal | Correct | Wrong |
 |---|---|---|
 | Daily at 00:05 UTC | `cron:0 5 0 * * *` | `cron:5 0 * * *` |
 | 06:00, 14:00, 22:00 UTC daily | `cron:0 0 6,14,22 * * *` | `cron:0 6,14,22 * * *` |
+
+### Schedule trigger `--node-spec` (multi-node only)
+
+In multi-node clusters every node validates the catalog at startup. By default a trigger has `node_spec: All`, meaning every node with `--plugin-dir` tries to **execute** it. For schedule plugins this means the plugin fires N times per tick (once per node) — and any node missing a plugin dependency (e.g. `httpx`) crashes on every tick. Pin schedule and request triggers to the node that should run them:
+
+```bash
+influxdb3 create trigger fabric_health \
+    --database nt \
+    --trigger-spec "every:5s" \
+    --path "schedule_fabric_health.py" \
+    --node-spec "nodes:nt-process" \    # schedule → process node
+    fabric_health
+
+influxdb3 create trigger top_talkers \
+    --database nt \
+    --trigger-spec "request:top_talkers" \
+    --path "request_top_talkers.py" \
+    --node-spec "nodes:nt-query" \      # request → query node
+    top_talkers
+```
+
+Single-node repos can omit `--node-spec` (default `all` is fine when there's only one node).
 
 ### Plugin filename → trigger type
 
@@ -162,16 +189,21 @@ The old form raises `TypeError: unhashable type: 'dict'` deep in the Jinja2 cach
 
 ## Compose / init.sh
 
-### Don't seed sentinel rows into tables that have an LVC
+### Create tables explicitly via `/api/v3/configure/table` (preferred)
 
-`init.sh` writes `__init` sentinel rows to make tables exist before the simulator boots. These rows leak into the LVC: `last_cache('table', 'cache_name')` returns the sentinel row alongside the real entities until the simulator overwrites every cache-key combination.
+bess and iiot use the **sentinel-row** pattern: `init.sh` writes one `__init` row at timestamp 1ns to make each table exist before caches and triggers reference it. The cost is that those rows leak into LVC reads, so consumers must filter `WHERE site <> '__init'` everywhere.
 
-Two options:
+`influxdb3-ref-network-telemetry` introduced the **explicit-create** pattern via the configure API (or the equivalent `influxdb3 create table` CLI). Tables get their full schema (and per-table retention) declared up front. No sentinel rows; no `__init` filter needed downstream.
 
-1. **Filter `WHERE site <> '__init'`** in every LVC consumer (plugin SQL, UI queries). Cheap, defensive, but the filter has to be repeated everywhere.
-2. **Don't seed rows that match the LVC key shape.** Rely on the simulator to write the first row before any consumer reads. Cleaner but requires every UI/plugin to handle the "table empty" case gracefully (which they should anyway).
+```bash
+influxdb3 create table fabric_health \
+    --database nt \
+    --tags site,layer \
+    --fields "status:utf8,spines_up:int64,bgp_up:int64,ingress_bps:float64,ecn_pct:float64" \
+    --retention-period 24h
+```
 
-The reference repos currently use option 1.
+CLI field-type names are `int64`, `uint64`, `float64`, `utf8`, `bool` — **not** the line-protocol shorthand `i64`/`string`. Use the explicit-create pattern for all new repos. bess and iiot can be migrated as a follow-up.
 
 ### Token bootstrap pattern
 
@@ -180,6 +212,121 @@ A one-shot `token-bootstrap` compose service generates the offline admin token b
 ### `INFLUXDB3_UNSET_VARS=LOG_FILTER`
 
 The `influxdb:3-enterprise` base image's defaults set the deprecated `LOG_FILTER` env var; if it leaks in via the compose env, the engine chokes on its own log output format. Always set `INFLUXDB3_UNSET_VARS: LOG_FILTER` (and a fresh `INFLUXDB3_LOG_FILTER: info`) on every `influxdb3`-image service in compose.
+
+### Healthchecks must include the admin token
+
+In recent Enterprise versions `/health` requires authentication and there's no longer a public unauthenticated probe. The bess/iiot pattern of `curl -s -o /dev/null http://.../health` (relying on "any HTTP roundtrip including 401 = server is up") doesn't reliably mark the container healthy any more.
+
+`token-bootstrap` writes a plain-text token alongside the JSON admin token file so healthchecks can `cat` it directly. Every InfluxDB node's healthcheck then passes it as a Bearer token and uses `curl --fail` (so non-2xx responses fail the check):
+
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "test -s /var/lib/influxdb3/.<db>-token-plain && curl -s --max-time 2 -o /dev/null --fail -H \"Authorization: Bearer $$(cat /var/lib/influxdb3/.<db>-token-plain)\" http://127.0.0.1:8181/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 120
+  start_period: 5s
+```
+
+Note `$$(cat …)` — compose interprets a single `$` as variable substitution; the doubled `$$` becomes `$` at runtime so the shell inside the container evaluates `$(cat …)`.
+
+The bess and iiot single-node compose files are also worth back-porting this fix to.
+
+## Multi-node compose pattern (clustered repos)
+
+Reference: `influxdb3-ref-network-telemetry` is the multi-node trailblazer. Subsequent clustered repos (Fleet, Data Center, etc.) should follow this shape unless their domain genuinely requires a different topology.
+
+### Shared `influxdb-data` named volume across every InfluxDB node
+
+The volume holds the object store, catalog, and admin token. Every node mounts it at `/var/lib/influxdb3` and uses `--object-store file --data-dir /var/lib/influxdb3`. **Sharing the disk is what makes the cluster a cluster** — every node sees the same database list, table schemas, caches, and triggers, and writes from any ingest node are immediately readable from query and process nodes. No coordination protocol needed.
+
+### Mode flags
+
+- `--mode ingest` — accepts writes
+- `--mode query` — serves reads + hosts request plugins
+- `--mode compact` — compaction-only; no HTTP traffic
+- `--mode process,query` — process node combo: query engine available locally for plugins to use `influxdb3_local.query()`, plus plugin runtime
+- Setting `--plugin-dir` automatically adds `process` mode
+
+### All InfluxDB nodes must mount the plugin directory
+
+Even nodes that don't execute plugins (ingest, compact) **read the catalog at startup and validate every registered trigger's plugin path**. If a trigger references `/plugins/foo.py` and the node doesn't have `/plugins` mounted, it panics with `Plugin not found` exit 101 on second-boot. Mount `./plugins:/plugins:ro` on **every** InfluxDB node.
+
+### Per-node `--virtual-env-location`
+
+The plugin runtime initializes a Python venv. The default location is `/plugins/.venv` which is read-only. Each InfluxDB node needs its own venv path inside the data volume so they don't fight:
+
+```
+--plugin-dir /plugins
+--virtual-env-location /var/lib/influxdb3/plugin-venv-<role>
+```
+
+Where `<role>` is `query`, `process`, `ingest-1`, `ingest-2`, `compact`, etc.
+
+### Plugin packages installed via `influxdb3 install package`
+
+The plugin venvs ship empty. Schedule plugins that depend on `httpx` (for cross-node write-back) need it installed on each node that runs them:
+
+```bash
+influxdb3 install package httpx --host http://nt-process:8181 --token "$TOKEN"
+```
+
+Run from `init.sh` after the cluster is up. With `--node-spec` pinning triggers to specific nodes, you only need the package installed on those targeted nodes.
+
+### Schedule plugin write-back via httpx (cross-node)
+
+A schedule plugin running on a process-only (or `process,query`) node has no obvious local ingest target — `LineBuilder` + `influxdb3_local.write()` aren't the right tool when the local node doesn't accept writes. Instead, schedule plugins import from a shared `plugins/_writeback.py` module that:
+
+1. Reads the admin token from the shared volume at module-import time.
+2. POSTs line protocol to a list of ingest URLs (compose-DNS names like `http://nt-ingest-1:8181`), round-robining across them.
+3. Falls back to the next URL on connection error.
+
+The required env vars on the process node:
+
+- `<DB>_INGEST_URLS` (comma-separated)
+- `<DB>_DB`
+- `<DB>_TOKEN_FILE`
+
+(replace `<DB>` with the per-repo prefix, e.g. `NT_INGEST_URLS`)
+
+`LineBuilder` is **not used** by schedule plugins on a process-only node.
+
+### Bring up the query node first to seed the license
+
+Bringing up all InfluxDB nodes simultaneously fires N parallel license-validation requests at the InfluxData license server, which intermittently 500s. Add `depends_on: influxdb3-query: service_healthy` to the other InfluxDB nodes so query validates the trial license alone first, writes it to the shared volume, and the others read it from cache:
+
+```yaml
+influxdb3-ingest-1:
+  depends_on:
+    token-bootstrap:
+      condition: service_completed_successfully
+    influxdb3-query:
+      condition: service_healthy
+```
+
+Process is implicitly ordered after query through its existing `ingest-1` dep. This adds maybe ~10 s to total bring-up time but eliminates flaky boots.
+
+### Demo wait-for-healthy uses `docker inspect`, not `docker compose ps`
+
+`docker compose ps SERVICE` filters by **service** names (`influxdb3-ingest-1`); the rest of the demo script uses **container** names (`nt-ingest-1`). Use `docker inspect --format '{{.State.Health.Status}}' <container>` for healthcheck polling — it accepts container names directly:
+
+```bash
+spin_until "${name} healthy" \
+    "docker inspect --format '{{.State.Health.Status}}' ${name} 2>/dev/null | grep -q '^healthy$'" 180
+```
+
+### Trigger registration on second-boot
+
+`init.sh`'s idempotent `create trigger` calls treat "already exists" as success — but if you change a trigger's flags (e.g. add `--node-spec`), the existing trigger **doesn't** get updated. Delete-and-recreate at the top of `ensure_triggers()`:
+
+```bash
+for t in fabric_health anomaly_detector top_talkers src_ip_detail; do
+    cli delete trigger "${t}" --database "${INFLUX_DB}" --force 2>/dev/null || true
+done
+# then create with current flags …
+```
+
+A no-op on first boot; corrects stale catalog entries on subsequent boots.
 
 ## Testing
 
@@ -208,6 +355,9 @@ The iiot test fakes use the tuple-AND pattern. See `iiot/tests/test_plugins/test
 - **Demo script (`scripts/demo.sh`) is narrative.** Banner, "what this demo shows", actor key (`[script]`/`[ui]`/`[sim]`/`[db]`), numbered "what's about to happen". Step through prereqs → bring-up → license validation → scenario → query results → request endpoint → LVC demo → summary. The bess and iiot scripts are mutually-templatable; bess is the seed.
 - **`Makefile` surface is identical** across repos: `up`, `down`, `clean`, `demo`, `demo-fresh`, `cli`, `query`, `cli-example`, `scenario`, `scenario-list`, `test`, `test-unit`, `test-scenarios`, `test-smoke`, `lint`, `format`.
 
-## When in doubt, look at iiot
+## When in doubt, look at the most recent reference
 
-`influxdb3-ref-iiot` is the most recent reference and was the source of most of the gotchas above. When a new repo's design has to make a choice the portfolio spec doesn't cover, default to the iiot pattern unless there's a domain reason not to.
+- **Single-node:** look at `influxdb3-ref-iiot`. It's the canonical single-node template — Python signals, two WAL plugin patterns, schedule + request triggers, the andon-board direct-fetch UI pattern.
+- **Multi-node:** look at `influxdb3-ref-network-telemetry`. It's the canonical multi-node template — 5-node compose, shared volume, plugin write-back via httpx, three UI patterns side-by-side, per-table retention, `every:` schedule format.
+
+When a new repo's design has to make a choice the portfolio spec doesn't cover, default to whichever of those matches your topology, unless there's a domain reason not to.
