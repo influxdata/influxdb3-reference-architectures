@@ -12,6 +12,32 @@ For the higher-level portfolio design, see [`docs/superpowers/specs/2026-04-23-r
 
 ## Processing Engine plugins
 
+### Installing plugins from the plugin registry over the API
+
+`influxdb3-ref-auto-manufacturing` trailblazes registry-based plugin install:
+a one-shot `plugin-installer` compose service resolves pinned
+`(name, version)` entries against the [public registry index](https://github.com/influxdata/influxdb3_plugins/releases/download/registry/index.json),
+downloads `{artifacts_url}/{name}-{version}.tar.gz`, verifies the sha256
+against the index `hash`, and uploads every file via
+`POST /api/v3/plugins/files` with `plugin_name = "{name}-{version}/<relpath>"`
+(the path relative to `--plugin-dir`; path separators work). Python deps come
+from the index's `dependencies.python` via the plugin-environment
+install_packages API. Repo-local plugins ride the same endpoint under
+`local/`, so the server needs **no plugin bind mount** and `--plugin-dir`
+lives inside the data volume. Idempotency is overwrite-on-boot. Prefer this
+over `gh:` paths for new repos; keep versions pinned.
+
+One sharp edge: one-shot services that write the healthcheck token (or any
+file the influxdb3 container reads as a non-root user) must chmod 644, not
+600 — a root-owned 600 file hangs the healthcheck forever with a malformed
+Authorization header.
+
+### The downsampler names output fields `<field>_<calc>`
+
+The registry `downsampler` plugin writes `temp_c` + `calculations=median` as
+`temp_c_median` (its README's examples suggest otherwise). Declare the
+suffixed name in explicit table creation and alias it back in SQL.
+
 ### `LineBuilder` is INJECTED, not imported
 
 The Processing Engine sets `LineBuilder` in the plugin module's globals before exec'ing the file. Do **not**:
@@ -31,6 +57,35 @@ For unit tests, monkeypatch a fake into the plugin module's namespace:
 ```python
 monkeypatch.setattr(mod, "LineBuilder", FakeLineBuilder, raising=False)
 ```
+
+### WAL triggers silently never fire if created before their table exists
+
+Create tables FIRST, triggers SECOND. A WAL (`table:`) trigger registered
+against a not-yet-existing table never fires — no error at creation time, no
+log line at write time, nothing in `system.processing_engine_logs`. Implicit
+table creation after the fact does not repair the binding; delete and recreate
+the trigger once the table exists. This is the portfolio's strongest argument
+for the explicit-create pattern (amendment A8): `init.sh` must order
+`create table` → `create trigger`. Verified empirically in
+`influxdb3-ref-auto-manufacturing`; its scenario tier regression-tests it.
+
+### Chained WAL triggers work (plugin writes fire downstream triggers)
+
+A plugin's `influxdb3_local.write()` goes through the normal write path, so it
+fires WAL triggers on the tables it writes — pipelines of the form
+`table A → WAL plugin → table B → WAL plugin → table C` work with no scheduler
+between stages, at roughly one WAL-flush interval (~1 s) of latency per hop.
+Subject to the table-ordering gotcha above. Reference implementation and
+regression test: `influxdb3-ref-auto-manufacturing`.
+
+### Duplicate-point resolution is not strictly last-write-wins
+
+When successive plugin runs rewrite the same series+timestamp (e.g. a forecast
+plugin re-writing overlapping future windows every tick), the surviving row is
+not reliably the most recent write — reads can return a per-timestamp mix of
+generations. If a consumer needs "the newest run", encode run identity in the
+data (auto-manufacturing derives it as `time − step` from the chronos plugin's
+`step` field) and select it at query time; don't rely on overwrite semantics.
 
 ### Schedule trigger format: `every:` vs `cron:`
 
@@ -359,5 +414,6 @@ The iiot test fakes use the tuple-AND pattern. See `iiot/tests/test_plugins/test
 
 - **Single-node:** look at `influxdb3-ref-iiot`. It's the canonical single-node template — Python signals, two WAL plugin patterns, schedule + request triggers, the andon-board direct-fetch UI pattern.
 - **Multi-node:** look at `influxdb3-ref-network-telemetry`. It's the canonical multi-node template — 5-node compose, shared volume, plugin write-back via httpx, three UI patterns side-by-side, per-table retention, `every:` schedule format.
+- **Plugin pipelines / registry install:** look at `influxdb3-ref-auto-manufacturing`. It's the canonical registry-consumption and chained-WAL-pipeline template — plugin-installer service, pinned sha256-verified artifacts over the files API, six-stage signal pipeline, no simulator service.
 
 When a new repo's design has to make a choice the portfolio spec doesn't cover, default to whichever of those matches your topology, unless there's a domain reason not to.
