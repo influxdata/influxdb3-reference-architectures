@@ -394,3 +394,18 @@ influxdb3-ref-scientific-infrastructure/
 ## 5. Definition of done
 
 All ten gates pass in sequence on the target machine (macOS, Docker Desktop, arm64); G10.2 and G10.3 pass back-to-back; the meta-repo PR is open. Anything recorded during the gates (retention representation, retention-write behaviour, the working Grafana query body, the `call_time` finding) is copied into ARCHITECTURE.md or CONVENTIONS.md, whichever is the right home.
+
+## 6. Outcome (2026-09-09)
+
+All ten gates passed in sequence on the target machine (macOS, Docker Desktop,
+arm64, `home` license — the trial for the configured address had expired, so
+`INFLUXDB3_ENTERPRISE_LICENSE_TYPE=home` was set in the local `.env`; the
+address was already verified, so no email click was needed). One commit per
+step in `influxdb3-ref-scientific-infrastructure`. Corrections made to this
+plan while executing are marked *(Recorded …)* / *(Corrected …)* inline: the
+collectd join-mode measurement names, the rollup write lag (10 buckets per
+60 s window, 30 s status threshold, 45 s node-down threshold), the retention
+CLI output, the hard-delete requirement, the trigger-spec JSON representation,
+the log-table lag, and the Grafana 13 alert-routing rules. The meta-repo
+changes (README row and column, CONVENTIONS additions, this plan) are
+committed on the `add-scientific-infrastructure` branch and not pushed.
