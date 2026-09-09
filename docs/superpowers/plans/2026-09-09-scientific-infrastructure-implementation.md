@@ -371,7 +371,7 @@ influxdb3-ref-scientific-infrastructure/
 - G9.1 `curl -s -u admin:admin http://localhost:3000/api/v1/provisioning/alert-rules` → exactly 3 rules: `sci-cpu-high`, `sci-temp-high`, `sci-node-down`.
 - G9.2 Steady state: `curl -s -u admin:admin http://localhost:3000/api/prometheus/grafana/api/v1/rules` → every rule `"state": "inactive"`, `"health": "ok"`, with one instance per host in state `Normal`; `curl -s -u admin:admin http://localhost:3000/api/prometheus/grafana/api/v1/alerts` → no instance in a state other than `Normal` (the endpoint lists Normal instances too).
 - G9.3 Node-down fires: `docker compose stop telegraf-compute` → within 2 minutes the alerts endpoint shows `sci-node-down` with label `host=compute` in state `firing`, and the overview alert-list panel shows it; `docker compose start telegraf-compute` → the instance leaves `firing` within 2 minutes.
-- G9.4 Threshold fires: edit `telegraf/storage.conf` temperature mock range to 85–95, `docker compose restart telegraf-storage` → within 2 minutes `sci-temp-high{host=storage}` is `firing`; revert the range and restart → resolves within 2 minutes; `git diff --stat` empty.
+- G9.4 Threshold fires: edit `telegraf/storage.conf` temperature mock range to 85–95, `docker compose restart telegraf-storage` → within 2 minutes `sci-temp-high{host=storage}` is `firing`; revert the range and restart → resolves within 2 minutes; `git diff --stat` empty. *(Superseded by step 11, which makes this fire periodically by design.)*
 - G9.5 Nothing is delivered: `curl -s -u admin:admin http://localhost:3000/api/v1/provisioning/policies` → root `receiver: empty` with one child route `alertname =~ .+` carrying `mute_time_intervals: ["always"]`; `curl -s -u admin:admin http://localhost:3000/api/v1/provisioning/contact-points` → `[]`; `curl -s -u admin:admin http://localhost:3000/api/v1/provisioning/mute-timings` → `always` present; during G9.3–G9.4 `docker compose logs grafana | grep -ci 'failed to send'` → `0`.
 
 **Commit:** `grafana: cpu/temperature/node-down alert rules, delivery muted`
@@ -390,6 +390,28 @@ influxdb3-ref-scientific-infrastructure/
 - G10.6 Meta-repo PR opened: README portfolio row + comparison-table column for this repo; CONVENTIONS.md additions — Telegraf `precision = "1ns"`, collectd needs a `types.db` in the Telegraf container, downsampler cron alignment + whole-second window truncation, Grafana `$__file{}` token provisioning.
 
 **Commit:** `docs, diagram, demo script`
+
+
+### Step 11 — Periodic alerts: sine-wave temperature and a flapping storage node (added 2026-09-09, approved)
+
+An empty alert list teaches nothing. The `storage` node misbehaves on purpose so both alert types fire and clear in turn while `daq` and `compute` stay green. Node-down timing constrains the cycle: the alert fires ~80 s after the agent goes silent (45 s age threshold + 30 s pending + evaluation, minus the 10–16 s the newest row is already old) and clears ~25 s after it returns, so a 30 s outage never fires; 2 minutes does.
+
+**Build**
+- `telegraf/storage.conf`: temperature becomes `[[inputs.mock.sine_wave]]` base 75, amplitude 12, `period = 0.00833333` (240 samples = 4 min per cycle; the plugin computes `sin((counter + phase) × period × π)`), so it is above 80 °C for ~87 s per cycle.
+- `telegraf/flap.sh` as the storage container command: `timeout $STORAGE_UP_S telegraf …; sleep $STORAGE_DOWN_S`, forever; `STORAGE_FLAP=false` execs Telegraf directly. `.env.example`: `STORAGE_FLAP=true`, `STORAGE_UP_S=180`, `STORAGE_DOWN_S=120`.
+- README, ARCHITECTURE §8/§11, FOR_MAINTAINERS. Earlier gates that assume storage is continuously up (G3.2-style counts for `storage`, G7.6, G9.3/G9.4) are superseded by this gate for that host.
+
+**Gate G11** (observe for ≥ 7 minutes, polling every 15 s)
+- G11.1 `docker compose config -q` → exit 0; `docker compose logs telegraf-storage` shows `[flap] agent up for 180s`.
+- G11.2 Sine range: `make query sql="SELECT min(temp_c), max(temp_c) FROM temperature WHERE host = 'storage' AND time > now() - INTERVAL '8 minutes'"` → min ≤ 66, max ≥ 84.
+- G11.3 `Temperature high{storage}` is observed `Alerting` at least once and `Normal` at least once during the window (Grafana `/api/prometheus/grafana/api/v1/alerts`).
+- G11.4 Flap: the storage log alternates `[flap] agent up` / `[flap] agent silent`; storage `cpu` rows over the last 8 minutes are between 240 and 400 (continuous would be 480); the overview status query for storage is observed `UP` and `DOWN` at least once each.
+- G11.5 `Node down{storage}` is observed `Alerting` at least once and `Normal` at least once during the window.
+- G11.6 The other nodes are untouched: `daq` and `compute` still 28–32 rows / 30 s, and no non-Normal alert instance carries their host label.
+- G11.7 Off switch: `STORAGE_FLAP=false docker compose up -d telegraf-storage` → no `[flap]` line in the new log, storage writes 28–32 rows / 30 s continuously for 3 minutes; restore with `docker compose up -d telegraf-storage`.
+- G11.8 Still nothing delivered: `docker compose logs grafana | grep -ci 'failed to send'` → `0`.
+
+**Commit:** `chaos: sine-wave temperature and a flapping storage node so alerts fire periodically`
 
 ## 5. Definition of done
 
