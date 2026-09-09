@@ -1,6 +1,6 @@
 # Conventions and gotchas
 
-Patterns and gotchas that hold across every reference-architecture repo in this portfolio. These are the lessons captured from shipping `influxdb3-ref-bess` (the pilot), `influxdb3-ref-iiot` (the second), and `influxdb3-ref-network-telemetry` (the multi-node trailblazer). Read this before starting a new repo or copy-pasting a pattern from one of the existing ones.
+Patterns and gotchas that hold across every reference-architecture repo in this portfolio. These are the lessons captured from shipping `influxdb3-ref-bess` (the pilot), `influxdb3-ref-iiot` (the second), `influxdb3-ref-network-telemetry` (the multi-node trailblazer), `influxdb3-ref-auto-manufacturing` (registry plugins) and `influxdb3-ref-scientific-infrastructure` (Telegraf + collectd + Grafana). Read this before starting a new repo or copy-pasting a pattern from one of the existing ones.
 
 For the higher-level portfolio design, see [`docs/superpowers/specs/2026-04-23-reference-architectures-portfolio-design.md`](docs/superpowers/specs/2026-04-23-reference-architectures-portfolio-design.md).
 
@@ -77,6 +77,24 @@ fires WAL triggers on the tables it writes — pipelines of the form
 between stages, at roughly one WAL-flush interval (~1 s) of latency per hop.
 Subject to the table-ordering gotcha above. Reference implementation and
 regression test: `influxdb3-ref-auto-manufacturing`.
+
+### The downsampler truncates its window to whole seconds — align the trigger to the wall clock
+
+The registry `downsampler` queries `[call_time − offset − window, call_time − offset)`
+and formats both bounds with `%H:%M:%S`. For sub-minute rollups use a
+wall-clock cron and an offset of one interval, e.g. 5 s buckets:
+`--trigger-spec "cron:*/5 * * * * *"` with `interval=5s,window=5s,offset=5s`.
+A tick at `:10` then reads exactly `[:00, :05)` — one complete bucket, written
+once (`record_count` equals the raw rate × 5). `every:5s` is not wall-clock
+aligned, straddles two buckets per tick and rewrites each bucket twice with
+partial data. Consequence: a bucket starting at `T` lands at `T + 2 × interval`,
+so "freshness" checks on rollup tables must allow at least that lag. Verified
+in `influxdb3-ref-scientific-infrastructure`.
+
+### `system.processing_engine_logs` trails real time
+
+The log table is persisted lazily and can be a minute or more behind; query it
+with a window of several minutes, not "the last minute".
 
 ### Duplicate-point resolution is not strictly last-write-wins
 
@@ -287,6 +305,70 @@ Note `$$(cat …)` — compose interprets a single `$` as variable substitution;
 
 The bess and iiot single-node compose files are also worth back-porting this fix to.
 
+### `show retention`, retention write rejection, and soft-deleted tables
+
+- `create database <db> --retention-period 5y` is accepted; `influxdb3 show
+  retention` lists one row per table with `retention_period` in hours
+  (`43830.0000h` for 5 y) and `source = database`.
+- A write whose timestamp is older than the cutoff is **rejected** (HTTP 400,
+  `write timestamp … is older than the retention period cutoff`); it is not
+  silently dropped and there is no way to backfill past the retention.
+- `influxdb3 delete table` only **soft-deletes**: the table lingers in
+  `information_schema.tables` as `<name>-<timestamp>` and cannot be
+  hard-deleted afterwards (409). Pass `--hard-delete now --yes` the first time
+  if the catalog must end up clean.
+- InfluxDB 3.11 deprecates `INFLUXDB3_ENTERPRISE_LICENSE_EMAIL` /
+  `_LICENSE_TYPE` and `INFLUXDB3_NODE_IDENTIFIER_PREFIX`; use
+  `INFLUXDB3_LICENSE_EMAIL`, `INFLUXDB3_LICENSE_TYPE` and `--node-id`. An
+  expired trial fails with `TrialExpired`; `home` (2 cores) is enough for a demo.
+
+## Telegraf, collectd and Grafana (agent-based repos)
+
+Reference: `influxdb3-ref-scientific-infrastructure`.
+
+### Telegraf needs `precision = "1ns"` for nanosecond timestamps
+
+`[agent] precision` defaults to `0s`, which means "round to the interval's
+order of magnitude, capped at 1 s" (`agent/agent.go`, `getPrecision`). With a
+1 s interval every timestamp lands on a whole second. Set `precision = "1ns"`
+explicitly. Service inputs (collectd, socket listeners) are unaffected either
+way — their timestamps pass through as received.
+
+### collectd through `inputs.socket_listener`
+
+- In `collectd_parse_multivalue = "join"` mode the measurement name is the
+  collectd **plugin** only (`cpu`, `load`, `memory`, or `collectd_cpu` … with
+  `name_prefix`); the type is the `type` tag and the instance is `type_instance`.
+  `split` mode is where `<plugin>_<dsname>` names such as `cpu_value` come from.
+- Telegraf ships no `types.db`. Without `collectd_typesdb = [...]` a
+  multi-value type such as `load` arrives as fields `0`, `1`, `2`. Ship a
+  minimal file with only the types you receive.
+- collectd multiplexes one measurement across `type_instance` values (six
+  `memory` rows per interval). Select the wanted rows with `tagpass` **before**
+  stripping tags with `taginclude`, or they collapse onto one series.
+- `[inputs.socket_listener.tagpass]` (any inline filter table) must be the
+  last thing in its plugin block; a `key = value` after it becomes part of
+  the table.
+- `processors.rename` field renames are not scoped to a measurement — give
+  each rename block a `namepass` when different measurements share a field
+  name (`value`).
+
+### Grafana provisioned from files against InfluxDB 3
+
+- Datasource: `type: influxdb`, `jsonData: {version: SQL, dbName: <db>,
+  httpMode: POST, insecureGrpc: true}` for plain http, `secureJsonData.token:
+  $__file{/tokens/<plain-token-file>}` — mount the token volume read-only into
+  Grafana and write the plain token with mode 644.
+- Grafana 13 ships **no contact points** and an `empty` root receiver, so
+  alerts go nowhere by default. To make that explicit, put an always-on mute
+  timing on a catch-all child route (`alertname =~ .+`); a mute timing on the
+  root route is rejected. Weekday ranges must start on Sunday.
+- Alert rules whose SQL returns one string column + one number per row become
+  one instance per label value without a Reduce step.
+- Provisioned alerting is read at start-up; `POST
+  /api/admin/provisioning/alerting/reload` reloads it, and a parse error is a
+  500 with the reason in Grafana's log.
+
 ## Multi-node compose pattern (clustered repos)
 
 Reference: `influxdb3-ref-network-telemetry` is the multi-node trailblazer. Subsequent clustered repos (Fleet, Data Center, etc.) should follow this shape unless their domain genuinely requires a different topology.
@@ -413,6 +495,7 @@ The iiot test fakes use the tuple-AND pattern. See `iiot/tests/test_plugins/test
 ## When in doubt, look at the most recent reference
 
 - **Single-node:** look at `influxdb3-ref-iiot`. It's the canonical single-node template — Python signals, two WAL plugin patterns, schedule + request triggers, the andon-board direct-fetch UI pattern.
+- **Agents + Grafana, no custom UI:** look at `influxdb3-ref-scientific-infrastructure`. Telegraf per node (one fed by collectd), per-agent filter/reshape, nanosecond timestamps, 5-year retention, cron-aligned downsampling, Grafana provisioned from files, manual validation gates instead of tests.
 - **Multi-node:** look at `influxdb3-ref-network-telemetry`. It's the canonical multi-node template — 5-node compose, shared volume, plugin write-back via httpx, three UI patterns side-by-side, per-table retention, `every:` schedule format.
 - **Plugin pipelines / registry install:** look at `influxdb3-ref-auto-manufacturing`. It's the canonical registry-consumption and chained-WAL-pipeline template — plugin-installer service, pinned sha256-verified artifacts over the files API, six-stage signal pipeline, no simulator service.
 
